@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "recgen_inference"
+version = "0.1.0"
+description = "RecGen: standalone inference for single-view and multi-view 3D reconstruction"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "LicenseRef-TRI-NC"}
+
+dependencies = [
+    "torch>=2.0",
+    "torchvision",
+    "numpy",
+    "scipy",
+    "Pillow",
+    "trimesh",
+    "safetensors",
+    "huggingface-hub",
+    "easydict",
+    "tqdm",
+    "plyfile",
+    "opencv-python-headless",
+]
+
+[project.optional-dependencies]
+# CUDA extensions — install separately based on your CUDA version:
+#   pip install spconv-cu118   (CUDA 11.8)
+#   pip install spconv-cu120   (CUDA 12.x)
+#   pip install flash-attn     (optional, for faster attention)
+
+# GLB texture export (heavy)
+glb = [
+    "xatlas",
+    "pyvista",
+    "pymeshfix",
+    "igraph",
+    "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8",
+]
+
+# Notebook visualisation
+notebook = [
+    "jupyter",
+    "ipywidgets",
+    "matplotlib",
+    "imageio",
+    "imageio-ffmpeg",
+]
+
+# Dev tools for tests + lint (used in CI)
+dev = [
+    "pytest",
+    "pre-commit",
+    "ruff",
+]
+
+# Everything
+all = ["recgen_inference[glb,notebook,dev]"]
+
+[tool.setuptools.packages.find]
+include = ["recgen_inference*"]
