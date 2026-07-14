@@ -47,7 +47,7 @@ import open3d as o3d
 import torch
 import trimesh
 from PIL import Image
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 from sklearn.neighbors import KDTree
 
@@ -465,6 +465,30 @@ app = FastAPI(
     description="Single-view RGB-D mesh reconstruction server",
     lifespan=_lifespan,
 )
+
+
+@app.middleware("http")
+async def _log_request_time(request: Request, call_next):
+    """Log wall-clock per request, as the caller experiences it.
+
+    Wider than the `run_recgen_*` lines, which cover only model + postprocess:
+    this also includes multipart parsing of the uploads (which happens during
+    dependency resolution, before the endpoint body runs), input decode, and
+    pickling. The gap between the two numbers is the request overhead.
+
+    Excludes writing the body to the socket, which happens after this returns —
+    so on a slow client the caller still sees more than this reports.
+    """
+    if request.url.path == "/health":
+        return await call_next(request)
+    start = time.time()
+    response = await call_next(request)
+    elapsed = time.time() - start
+    print(
+        f"[recgen_fastapi] {request.method} {request.url.path} "
+        f"-> {response.status_code} in {elapsed:.2f}s"
+    )
+    return response
 
 
 @app.get("/health")
