@@ -74,6 +74,57 @@ def mesh_from_result(mesh_result: Any) -> trimesh.Trimesh:
     return trimesh.Trimesh(vertices=verts, faces=faces, vertex_colors=vertex_colors)
 
 
+def coarse_mesh_from_coords(
+    coords: Any,
+    res: int = 64,
+    grid_resolution: int = 32,
+) -> trimesh.Trimesh:
+    """Marching-cubes mesh from the coarse sparse-structure occupancy voxels.
+
+    The sparse-structure stage yields occupancy voxel indices in ``[0, res)`` (the
+    SLAT resolution). This bins them into a dense ``grid_resolution^3`` volume,
+    downsampling ``res -> grid_resolution`` for a coarser/faster surface, and runs
+    marching cubes. Vertices are mapped into the same normalized cube frame the
+    SLAT mesh uses (``index / grid_resolution - 0.5``), so the same pose /
+    ``cam2ncam`` transform places the mesh in the camera frame.
+
+    Args:
+        coords: (N, 3) or (N, 4) int voxel indices. A 4th leading column (batch)
+            is dropped. Accepts a torch tensor or numpy array.
+        res: Full occupancy grid resolution the coords index (SLAT resolution).
+        grid_resolution: Target volume resolution for marching cubes. Smaller =
+            coarser and faster (e.g. 16 or 32).
+
+    Returns:
+        An (untextured) ``trimesh.Trimesh`` in the normalized cube ``[-0.5, 0.5]^3``.
+    """
+    from skimage.measure import marching_cubes
+
+    if hasattr(coords, "detach"):
+        coords = coords.detach().cpu().numpy()
+    coords = np.asarray(coords)
+    if coords.ndim != 2 or coords.shape[1] not in (3, 4):
+        raise ValueError(f"coords must be (N, 3) or (N, 4), got {coords.shape}")
+    if coords.shape[1] == 4:
+        coords = coords[:, 1:]
+    if coords.shape[0] == 0:
+        raise ValueError("coarse occupancy is empty (no voxels)")
+
+    D = int(grid_resolution)
+    idx = np.clip(
+        (coords.astype(np.float64) * D / float(res)).astype(np.int64), 0, D - 1
+    )
+    vol = np.zeros((D, D, D), dtype=np.float32)
+    vol[idx[:, 0], idx[:, 1], idx[:, 2]] = 1.0
+    # Pad with a zero border so the surface closes at the volume boundary.
+    vol = np.pad(vol, 1, mode="constant", constant_values=0.0)
+
+    verts, faces, normals, _ = marching_cubes(vol, level=0.5)
+    verts = verts - 1.0  # undo the pad offset
+    verts = verts / D - 0.5  # grid index -> normalized cube [-0.5, 0.5]
+    return trimesh.Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
+
+
 def intrinsics_from_params(fx: float, fy: float, cx: float, cy: float) -> np.ndarray:
     """Build a (3, 3) float32 intrinsics matrix from individual focal / principal-point values."""
     return np.array(

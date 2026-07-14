@@ -13,7 +13,7 @@ from recgen_inference.preprocessing import (
     pointmap_from_depth,
     preprocess_view,
 )
-from recgen_inference.utils import mesh_from_result, parse_pose
+from recgen_inference.utils import coarse_mesh_from_coords, mesh_from_result, parse_pose
 
 
 def _preprocess_single(
@@ -67,11 +67,17 @@ def _build_result_from_outputs(
     cam2ncam: np.ndarray,
     rgb: np.ndarray,
     intrinsics: np.ndarray,
+    raw_trimesh: Optional[Any] = None,
 ) -> RecGenResult:
-    """Shared postprocessing path: parse pose, build mesh, transform into camera frame."""
+    """Shared postprocessing path: parse pose, build mesh, transform into camera frame.
+
+    If ``raw_trimesh`` is provided it is used directly (e.g. the coarse
+    marching-cubes mesh); otherwise the mesh is decoded from ``outputs['mesh']``.
+    """
     pose_matrix, parsed_pose, pose_representation = parse_pose(outputs)
 
-    raw_trimesh = mesh_from_result(outputs["mesh"][0])
+    if raw_trimesh is None:
+        raw_trimesh = mesh_from_result(outputs["mesh"][0])
 
     final_mesh = raw_trimesh.copy()
     final_mesh.apply_transform(pose_matrix)
@@ -104,6 +110,7 @@ def generate(
     mask_erosion_enabled: bool = True,
     mask_erosion_params: Optional[Dict[str, int]] = None,
     use_pointmap: bool = True,
+    formats: List[str] = ["mesh", "gaussian", "radiance_field"],
 ) -> RecGenResult:
     """Generate a 3D mesh from a single RGB-D view.
 
@@ -121,6 +128,8 @@ def generate(
         mask_erosion_enabled: Whether to erode the mask before preprocessing.
         mask_erosion_params: Optional ``{"kernel_size": int, "iterations": int}`` override.
         use_pointmap: If False, the pipeline runs without the pointmap branch.
+        formats: Which SLAT decoders to run. Pass ``["mesh"]`` to skip the
+            gaussian / radiance-field decoders when only the mesh is needed.
     """
     proc = _preprocess_single(
         image,
@@ -138,9 +147,74 @@ def generate(
         pointmap=proc["pointmap"] if use_pointmap else None,
         mask=proc["mask"],
         seed=seed,
+        formats=formats,
     )
 
     return _build_result_from_outputs(outputs, proc["cam2ncam"], rgb=image, intrinsics=intrinsics)
+
+
+def generate_coarse(
+    pipeline: Any,
+    image: np.ndarray,
+    depth: np.ndarray,
+    mask: np.ndarray,
+    intrinsics: np.ndarray,
+    *,
+    seed: int = 1,
+    quantile_drop_threshold: float = 0.05,
+    clamp_range: Tuple[float, float] = (-2.0, 3.0),
+    mask_erosion_enabled: bool = True,
+    mask_erosion_params: Optional[Dict[str, int]] = None,
+    use_pointmap: bool = True,
+    grid_resolution: int = 32,
+    sparse_structure_sampler_params: Optional[Dict[str, Any]] = None,
+) -> RecGenResult:
+    """Generate a *coarse* mesh from a single RGB-D view (sparse-structure stage only).
+
+    This runs only the first pipeline stage — sparse-structure + pose sampling —
+    and turns the occupancy voxels into an untextured mesh via marching cubes. It
+    skips the expensive SLAT sampling + mesh decoder, so it is substantially
+    faster than :func:`generate`, at the cost of a blocky, colorless mesh. Pose is
+    identical to the full pipeline (SLAT does not refine pose).
+
+    Args:
+        grid_resolution: Voxel resolution for the marching-cubes volume. Smaller =
+            coarser and faster (e.g. 16 or 32). The occupancy is downsampled from
+            the model's native resolution to this before meshing.
+        sparse_structure_sampler_params: Optional overrides for the sparse-structure
+            sampler (e.g. ``{"steps": 12}`` to trade quality for speed).
+
+    Returns a :class:`RecGenResult` whose ``mesh`` has gray fallback colors and an
+    empty ``_outputs`` (no gaussian / radiance field).
+    """
+    proc = _preprocess_single(
+        image,
+        depth,
+        mask,
+        intrinsics,
+        quantile_drop_threshold=quantile_drop_threshold,
+        clamp_range=clamp_range,
+        mask_erosion_enabled=mask_erosion_enabled,
+        mask_erosion_params=mask_erosion_params,
+    )
+
+    coarse = pipeline.run_pointmap_coarse(
+        proc["image"],
+        pointmap=proc["pointmap"] if use_pointmap else None,
+        mask=proc["mask"],
+        seed=seed,
+        sparse_structure_sampler_params=sparse_structure_sampler_params or {},
+    )
+
+    res = getattr(pipeline.models["slat_flow_model"], "resolution", 64)
+    raw_trimesh = coarse_mesh_from_coords(
+        coarse["coords"], res=res, grid_resolution=grid_resolution
+    )
+
+    outputs = {"pose": coarse["pose"]}
+    return _build_result_from_outputs(
+        outputs, proc["cam2ncam"], rgb=image, intrinsics=intrinsics, raw_trimesh=raw_trimesh
+    )
 
 
 def generate_multiview(

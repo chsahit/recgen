@@ -505,6 +505,51 @@ class RecGenPipeline(Pipeline):
         return output
 
     @torch.no_grad()
+    def run_pointmap_coarse(
+        self,
+        image: Image.Image,
+        pointmap: Union[Image.Image, torch.Tensor] = None,
+        mask: Image.Image = None,
+        num_samples: int = 1,
+        seed: int = 42,
+        sparse_structure_sampler_params: dict = {},
+    ) -> dict:
+        """Run only the coarse (sparse-structure) stage of the pipeline.
+
+        This mirrors the first half of :meth:`run_pointmap` — image/pointmap/mask
+        conditioning followed by ``sample_sparse_structure_pose`` — but stops before
+        the (expensive) SLAT sampling + decoding. It returns the occupancy voxel
+        ``coords`` and the estimated ``pose`` (the SLAT stage does not refine pose,
+        so this is the same pose the full pipeline reports).
+
+        Returns:
+            dict with keys ``coords`` (occupancy voxel indices, resolution =
+            ``slat_flow_model.resolution``), ``pose`` (denormalized anchor pose),
+            and ``pose_normalized`` (SLAT-conditioning pose).
+        """
+        if pointmap is not None:
+            if isinstance(pointmap, torch.Tensor):
+                if pointmap.ndim == 3:
+                    pointmap_arg = pointmap.unsqueeze(0)
+                elif pointmap.ndim == 4:
+                    pointmap_arg = pointmap
+                else:
+                    raise ValueError(f"Unsupported tensor pointmap shape: {pointmap.shape}")
+            else:
+                pointmap_arg = [pointmap]
+        else:
+            pointmap_arg = None
+
+        mask_arg = [mask] if mask is not None else None
+        cond_sparse = self.get_cond([image], pointmap=pointmap_arg, mask=mask_arg,
+                                    model_key='sparse_structure_pose_flow_model')
+        torch.manual_seed(seed)
+        coords, pose_normalized, pose, _all_poses = self.sample_sparse_structure_pose(
+            cond_sparse, num_samples, sparse_structure_sampler_params
+        )
+        return {'coords': coords, 'pose': pose, 'pose_normalized': pose_normalized}
+
+    @torch.no_grad()
     def get_cond_multiview(
         self,
         images: List[Image.Image],

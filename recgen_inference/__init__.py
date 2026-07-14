@@ -9,13 +9,14 @@ Quick start:
 
 from recgen_inference import build_recgen
 from recgen_inference._result import RecGenResult
-from recgen_inference.inference import generate, generate_multiview
+from recgen_inference.inference import generate, generate_coarse, generate_multiview
 
 __version__ = "0.1.0"
 
 __all__ = [
     "build_recgen",
     "generate",
+    "generate_coarse",
     "generate_multiview",
     "RecGenResult",
     "__version__",
