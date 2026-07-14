@@ -518,6 +518,31 @@ def _archive(experiment_id: str, files: dict) -> None:
         print(f"[recgen_fastapi] --save-outputs write failed for {experiment_id}: {e}")
 
 
+def _decode_scene(rgb_bytes, depth_bytes, intr_bytes, depth_name):
+    """Decode the per-frame (object-independent) inputs: (image, depth_map, K).
+
+    Split out of :func:`_load_request_inputs` so /coarse_mesh_batch/ pays this
+    once per frame instead of once per object — the scene RGB-D is ~3.4MB and its
+    multipart parse + PIL decode was ~0.4s of every ~0.9s single call.
+    """
+    image = Image.open(io.BytesIO(rgb_bytes)).convert("RGB")
+    depth_map = _decode_depth(depth_bytes, depth_name)
+    K = _decode_intrinsics(intr_bytes)
+    if depth_map.shape[:2] != (image.size[1], image.size[0]):
+        raise _BadRequest(f"depth shape {depth_map.shape[:2]} does not match rgb {(image.size[1], image.size[0])}")
+    return image, depth_map, K
+
+
+def _decode_mask(mask_bytes, depth_map, what="mask"):
+    """Decode one binary mask and check it against the frame. Raises _BadRequest."""
+    mask_arr = np.asarray(Image.open(io.BytesIO(mask_bytes))) > 0
+    if mask_arr.ndim == 3:
+        mask_arr = mask_arr[..., 0]
+    if mask_arr.shape[:2] != depth_map.shape[:2]:
+        raise _BadRequest(f"{what} shape {mask_arr.shape[:2]} does not match depth {depth_map.shape[:2]}")
+    return mask_arr
+
+
 async def _load_request_inputs(experiment_id, rgb, depth, mask, intrinsics):
     """Decode and validate the four uploads.
 
@@ -538,18 +563,8 @@ async def _load_request_inputs(experiment_id, rgb, depth, mask, intrinsics):
         "intrinsics.npy": intr_bytes,
     })
 
-    image = Image.open(io.BytesIO(rgb_bytes)).convert("RGB")
-    depth_map = _decode_depth(depth_bytes, depth_name)
-    K = _decode_intrinsics(intr_bytes)
-    mask_arr = np.asarray(Image.open(io.BytesIO(mask_bytes))) > 0
-    if mask_arr.ndim == 3:
-        mask_arr = mask_arr[..., 0]
-
-    if depth_map.shape[:2] != (image.size[1], image.size[0]):
-        raise _BadRequest(f"depth shape {depth_map.shape[:2]} does not match rgb {(image.size[1], image.size[0])}")
-    if mask_arr.shape[:2] != depth_map.shape[:2]:
-        raise _BadRequest(f"mask shape {mask_arr.shape[:2]} does not match depth {depth_map.shape[:2]}")
-
+    image, depth_map, K = _decode_scene(rgb_bytes, depth_bytes, intr_bytes, depth_name)
+    mask_arr = _decode_mask(mask_bytes, depth_map)
     return image, depth_map, mask_arr, K
 
 
@@ -635,6 +650,98 @@ async def coarse_mesh_endpoint(
         return JSONResponse(
             content={"error": str(e), "reason": "degenerate_completion"}, status_code=422
         )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.post("/coarse_mesh_batch/")
+async def coarse_mesh_batch_endpoint(
+    rgb: UploadFile = File(..., description="Full UNMASKED scene RGB image (PNG), sent ONCE"),
+    depth: UploadFile = File(..., description="Full UNMASKED scene depth (.png uint16 mm or .npy float32 m), sent ONCE"),
+    masks: list[UploadFile] = File(..., description="N per-object binary mask PNGs for the SAME frame"),
+    intrinsics: UploadFile = File(..., description="Camera intrinsics .npy (3x3 K or [fx,fy,cx,cy])"),
+    grid_resolution: int = 32,
+    steps: int = 20,
+):
+    """N objects from ONE frame in one request: /coarse_mesh/ batched over masks.
+
+    Motivation (coarse_latency_tax_0714_night §5): the policy's first featurize
+    pass prices ~19-21 candidates against a single freshly-ingested frame, and
+    per-call the shared ~3.4MB scene payload plus its multipart parse and PIL
+    decode (~0.4s of a ~0.9s call) was paid once PER OBJECT. Here it is paid once
+    per frame, so N objects cost ~upload + parse + N x compute instead of
+    N x (upload + parse + compute).
+
+    Returns a pickled ``list[dict]``, one entry per input mask, **in input
+    order**:
+        {"index": i, "name": <mask filename>, "ok": True,  "mesh": {vertices, faces, vertex_colors}}
+        {"index": i, "name": <mask filename>, "ok": False, "error": str, "reason": str}
+
+    **Per-object failures do not fail the batch.** A degenerate object (the
+    /coarse_mesh/ 422 case — concave_heavy_1's green_koosh_ball 422s on ~13% of
+    mints) comes back as one ``ok=False`` entry with reason
+    ``degenerate_completion`` while its siblings return meshes; an all-degenerate
+    batch is still HTTP 200 with every entry ``ok=False``. Only frame-level
+    problems (rgb/depth shape mismatch, undecodable intrinsics) 400 the request,
+    because those invalidate every object. Callers must check ``ok`` per entry.
+
+    Meshes are identical to what /coarse_mesh/ returns for the same (frame, mask):
+    same standard-pinhole camera frame, same pose, same grid_resolution/steps
+    semantics. This endpoint only amortizes the per-request scene work — the
+    diffusion still runs once per object, sequentially. GPU-batching the
+    sparse-structure stage across objects is the larger prize and is NOT done here.
+    """
+    experiment_id = f"{int(time.time() * 1000)}"
+    start = time.time()
+    try:
+        rgb_bytes = await rgb.read()
+        depth_bytes = await depth.read()
+        intr_bytes = await intrinsics.read()
+        mask_blobs = [(m.filename or f"mask_{i}.png", await m.read())
+                      for i, m in enumerate(masks)]
+
+        rgb_name = rgb.filename or "rgb.png"
+        depth_name = depth.filename or "depth.png"
+        _archive(experiment_id, {
+            "rgb" + os.path.splitext(rgb_name)[1]: rgb_bytes,
+            "depth" + os.path.splitext(depth_name)[1]: depth_bytes,
+            "intrinsics.npy": intr_bytes,
+            **{f"mask_{i}" + os.path.splitext(name)[1]: blob
+               for i, (name, blob) in enumerate(mask_blobs)},
+        })
+
+        # Frame-level: decode once, and a failure here 400s the whole batch.
+        image, depth_map, K = _decode_scene(rgb_bytes, depth_bytes, intr_bytes, depth_name)
+
+        results = []
+        for i, (name, blob) in enumerate(mask_blobs):
+            # Object-level: isolate every failure to its own entry.
+            try:
+                mask_arr = _decode_mask(blob, depth_map, what=f"mask[{i}] ({name})")
+                mesh_dict = run_recgen_coarse(image, depth_map, mask_arr, K,
+                                              grid_resolution=grid_resolution, steps=steps)
+                results.append({"index": i, "name": name, "ok": True, "mesh": mesh_dict})
+            except _DegenerateCompletion as e:
+                results.append({"index": i, "name": name, "ok": False,
+                                "error": str(e), "reason": "degenerate_completion"})
+            except _BadRequest as e:
+                results.append({"index": i, "name": name, "ok": False,
+                                "error": str(e), "reason": "bad_request"})
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                results.append({"index": i, "name": name, "ok": False,
+                                "error": f"{type(e).__name__}: {e}", "reason": "error"})
+
+        n_ok = sum(r["ok"] for r in results)
+        print(f"coarse_mesh_batch done in {time.time() - start:.2f}s "
+              f"({n_ok}/{len(results)} ok, grid={grid_resolution}, steps={steps})")
+        return _pickle_and_respond(results, experiment_id)
+
+    except _BadRequest as e:
+        return JSONResponse(content={"error": str(e)}, status_code=400)
     except Exception as e:
         import traceback
         traceback.print_exc()
