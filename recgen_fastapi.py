@@ -24,6 +24,8 @@ if _env_lib not in os.environ.get("LD_LIBRARY_PATH", "").split(":"):
     ).rstrip(":")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
+import argparse
+import io
 import pickle
 import time
 from contextlib import asynccontextmanager
@@ -46,7 +48,7 @@ import torch
 import trimesh
 from PIL import Image
 from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sklearn.neighbors import KDTree
 
 from recgen_inference import build_recgen, generate, generate_coarse
@@ -76,17 +78,18 @@ if COMPILE and DEVICE == "cuda":
 
 # ── Input loaders (match sam3d_fastapi semantics) ─────────────────────────────
 
-def _load_depth_file(path: str) -> np.ndarray:
-    """Load a depth map as float32 meters with 0 where invalid.
+def _decode_depth(data: bytes, filename: str) -> np.ndarray:
+    """Decode a depth map as float32 meters with 0 where invalid.
 
     Accepts .npy (float32 meters) or .png (uint16 millimeters following the
-    existing capture-zip convention). Non-finite pixels are zeroed out.
+    existing capture-zip convention), dispatched on `filename`'s extension.
+    Non-finite pixels are zeroed out.
     """
-    ext = os.path.splitext(path)[1].lower()
+    ext = os.path.splitext(filename)[1].lower()
     if ext == ".npy":
-        depth = np.load(path).astype(np.float32)
+        depth = np.load(io.BytesIO(data)).astype(np.float32)
     else:
-        arr = np.array(Image.open(path))
+        arr = np.array(Image.open(io.BytesIO(data)))
         if arr.dtype == np.uint16:
             depth = arr.astype(np.float32) / 1000.0
         else:
@@ -95,9 +98,9 @@ def _load_depth_file(path: str) -> np.ndarray:
     return depth
 
 
-def _load_intrinsics_file(path: str) -> np.ndarray:
-    """Load intrinsics as a 3x3 K matrix. Accepts 3x3 K or 4-vector [fx,fy,cx,cy]."""
-    K = np.load(path)
+def _decode_intrinsics(data: bytes) -> np.ndarray:
+    """Decode intrinsics as a 3x3 K matrix. Accepts 3x3 K or 4-vector [fx,fy,cx,cy]."""
+    K = np.load(io.BytesIO(data))
     if K.shape == (3, 3):
         return K.astype(np.float64)
     if K.shape == (4,):
@@ -440,8 +443,15 @@ def _warmup() -> None:
 
 # ── FastAPI app ──────────────────────────────────────────────────────────────
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-API_OUTPUT_DIR = os.path.join(os.environ["HOME"], "orcd", "scratch", "api_outputs_recgen")
+API_OUTPUT_DIR = os.path.join(
+    os.path.expanduser("~"), "orcd", "scratch", "api_outputs_recgen"
+)
+
+# Archival only: nothing in a request's behavior depends on these files. Off by
+# default so a long-lived server doesn't accumulate a directory-per-request on
+# NFS scratch; enable with --save-outputs (or RECGEN_SAVE_OUTPUTS=1) when you
+# want to inspect what a caller actually sent.
+SAVE_OUTPUTS = os.environ.get("RECGEN_SAVE_OUTPUTS", "0") != "0"
 
 
 @asynccontextmanager
@@ -466,28 +476,48 @@ class _BadRequest(Exception):
     """Raised for input-shape mismatches so the endpoint returns HTTP 400."""
 
 
-async def _load_request_inputs(experiment_dir, rgb, depth, mask, intrinsics):
-    """Save the four uploads to `experiment_dir` and load/validate them.
+def _archive(experiment_id: str, files: dict) -> None:
+    """Write `{name: bytes}` into this request's output dir. Archival only.
+
+    Best-effort by design: this runs on requests that are otherwise fine, so a
+    full or unwritable scratch mount must not turn a good completion into a 500.
+    """
+    if not SAVE_OUTPUTS:
+        return
+    try:
+        experiment_dir = os.path.join(API_OUTPUT_DIR, experiment_id)
+        os.makedirs(experiment_dir, exist_ok=True)
+        for name, data in files.items():
+            with open(os.path.join(experiment_dir, name), "wb") as f:
+                f.write(data)
+    except OSError as e:
+        print(f"[recgen_fastapi] --save-outputs write failed for {experiment_id}: {e}")
+
+
+async def _load_request_inputs(experiment_id, rgb, depth, mask, intrinsics):
+    """Decode and validate the four uploads.
 
     Returns (image, depth_map, mask_arr, K). Raises _BadRequest on shape mismatch.
     """
-    rgb_path = os.path.join(experiment_dir, "rgb" + os.path.splitext(rgb.filename or "rgb.png")[1])
-    depth_path = os.path.join(experiment_dir, "depth" + os.path.splitext(depth.filename or "depth.png")[1])
-    mask_path = os.path.join(experiment_dir, "mask" + os.path.splitext(mask.filename or "mask.png")[1])
-    intr_path = os.path.join(experiment_dir, "intrinsics.npy")
-    with open(rgb_path, "wb") as f:
-        f.write(await rgb.read())
-    with open(depth_path, "wb") as f:
-        f.write(await depth.read())
-    with open(mask_path, "wb") as f:
-        f.write(await mask.read())
-    with open(intr_path, "wb") as f:
-        f.write(await intrinsics.read())
+    rgb_bytes = await rgb.read()
+    depth_bytes = await depth.read()
+    mask_bytes = await mask.read()
+    intr_bytes = await intrinsics.read()
 
-    image = Image.open(rgb_path).convert("RGB")
-    depth_map = _load_depth_file(depth_path)
-    K = _load_intrinsics_file(intr_path)
-    mask_arr = np.asarray(Image.open(mask_path)) > 0
+    rgb_name = rgb.filename or "rgb.png"
+    depth_name = depth.filename or "depth.png"
+    mask_name = mask.filename or "mask.png"
+    _archive(experiment_id, {
+        "rgb" + os.path.splitext(rgb_name)[1]: rgb_bytes,
+        "depth" + os.path.splitext(depth_name)[1]: depth_bytes,
+        "mask" + os.path.splitext(mask_name)[1]: mask_bytes,
+        "intrinsics.npy": intr_bytes,
+    })
+
+    image = Image.open(io.BytesIO(rgb_bytes)).convert("RGB")
+    depth_map = _decode_depth(depth_bytes, depth_name)
+    K = _decode_intrinsics(intr_bytes)
+    mask_arr = np.asarray(Image.open(io.BytesIO(mask_bytes))) > 0
     if mask_arr.ndim == 3:
         mask_arr = mask_arr[..., 0]
 
@@ -499,15 +529,14 @@ async def _load_request_inputs(experiment_dir, rgb, depth, mask, intrinsics):
     return image, depth_map, mask_arr, K
 
 
-def _pickle_and_respond(mesh_dict, experiment_dir, experiment_id):
-    """Pickle the mesh dict and return it as a downloadable FileResponse."""
-    out_path = os.path.join(experiment_dir, "mesh.pkl")
-    with open(out_path, "wb") as f:
-        pickle.dump(mesh_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
-    return FileResponse(
-        path=out_path,
-        filename=f"mesh_{experiment_id}.pkl",
+def _pickle_and_respond(mesh_dict, experiment_id):
+    """Pickle the mesh dict and return it as a downloadable response body."""
+    payload = pickle.dumps(mesh_dict, protocol=pickle.HIGHEST_PROTOCOL)
+    _archive(experiment_id, {"mesh.pkl": payload})
+    return Response(
+        content=payload,
         media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="mesh_{experiment_id}.pkl"'},
     )
 
 
@@ -526,14 +555,12 @@ async def complete_mesh_endpoint(
     modulo the frame difference (sam3d returns PyTorch3D camera frame).
     """
     experiment_id = f"{int(time.time() * 1000)}"
-    experiment_dir = os.path.join(API_OUTPUT_DIR, experiment_id)
-    os.makedirs(experiment_dir, exist_ok=True)
     try:
         image, depth_map, mask_arr, K = await _load_request_inputs(
-            experiment_dir, rgb, depth, mask, intrinsics
+            experiment_id, rgb, depth, mask, intrinsics
         )
         mesh_dict = run_recgen_single(image, depth_map, mask_arr, K)
-        return _pickle_and_respond(mesh_dict, experiment_dir, experiment_id)
+        return _pickle_and_respond(mesh_dict, experiment_id)
 
     except _BadRequest as e:
         return JSONResponse(content={"error": str(e)}, status_code=400)
@@ -571,14 +598,12 @@ async def coarse_mesh_endpoint(
     pipeline's native config uses 25). Fewer steps is faster but coarser.
     """
     experiment_id = f"{int(time.time() * 1000)}"
-    experiment_dir = os.path.join(API_OUTPUT_DIR, experiment_id)
-    os.makedirs(experiment_dir, exist_ok=True)
     try:
         image, depth_map, mask_arr, K = await _load_request_inputs(
-            experiment_dir, rgb, depth, mask, intrinsics
+            experiment_id, rgb, depth, mask, intrinsics
         )
         mesh_dict = run_recgen_coarse(image, depth_map, mask_arr, K, grid_resolution=grid_resolution, steps=steps)
-        return _pickle_and_respond(mesh_dict, experiment_dir, experiment_id)
+        return _pickle_and_respond(mesh_dict, experiment_id)
 
     except _BadRequest as e:
         return JSONResponse(content={"error": str(e)}, status_code=400)
@@ -595,7 +620,20 @@ async def coarse_mesh_endpoint(
 if __name__ == "__main__":
     import uvicorn
 
-    os.makedirs(API_OUTPUT_DIR, exist_ok=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--save-outputs",
+        action="store_true",
+        help="Archive each request's uploads and resulting mesh.pkl under "
+             f"{API_OUTPUT_DIR}/<request-id>/. Off by default; affects nothing "
+             "about the response.",
+    )
+    args = parser.parse_args()
+    if args.save_outputs:
+        SAVE_OUTPUTS = True
+        os.makedirs(API_OUTPUT_DIR, exist_ok=True)
+        print(f"[recgen_fastapi] --save-outputs: archiving to {API_OUTPUT_DIR}")
+
     # Pass the app object, not "recgen_fastapi:app": the import-string form makes
     # uvicorn import this module a second time (it is __main__ here, so the import
     # doesn't hit sys.modules), which builds and uploads a whole second copy of the
