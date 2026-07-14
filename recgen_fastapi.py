@@ -26,6 +26,18 @@ if _env_lib not in os.environ.get("LD_LIBRARY_PATH", "").split(":"):
 
 import pickle
 import time
+from contextlib import asynccontextmanager
+
+# Give inductor a cache dir that survives restarts, so the startup warmup below is a
+# cache hit (~10s) instead of a cold compile (~30s). Only a fallback: if the
+# environment already sets TORCHINDUCTOR_CACHE_DIR this is a no-op. It matters where
+# it doesn't (e.g. in the container), since inductor otherwise defaults to
+# /tmp/torchinductor_$USER, which doesn't outlive the container. Must precede
+# `import torch`.
+os.environ.setdefault(
+    "TORCHINDUCTOR_CACHE_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".torchinductor_cache"),
+)
 
 import fast_simplification
 import numpy as np
@@ -45,6 +57,21 @@ from recgen_inference import build_recgen, generate, generate_coarse
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 PIPELINE_NAME = os.environ.get("RECGEN_PIPELINE", "recgen_base.multiview_stereo")
 pipeline = build_recgen.build(PIPELINE_NAME)
+
+# The sparse-structure denoiser is ~60% of a /coarse_mesh/ request: the sampler runs
+# it ~35x per request (one forward per step, twice per step inside the CFG interval).
+# It is compute-bound at batch 1, so batching the CFG pair buys nothing, but inductor's
+# fusion is worth ~1.6x. Shapes are fixed across requests (cond is always 1x1369x1024,
+# latent 1x8x16^3), so dynamic=False compiles exactly one graph.
+# Set RECGEN_COMPILE=0 to fall back to eager.
+#
+# NOTE: don't be tempted to switch on TF32 here — allow_tf32/matmul_precision("high")
+# measured *50% slower* on this model (it pushes the fp32 head off the fp16 kernels).
+COMPILE = os.environ.get("RECGEN_COMPILE", "1") != "0"
+if COMPILE and DEVICE == "cuda":
+    pipeline.models["sparse_structure_pose_flow_model"] = torch.compile(
+        pipeline.models["sparse_structure_pose_flow_model"], dynamic=False
+    )
 
 
 # ── Input loaders (match sam3d_fastapi semantics) ─────────────────────────────
@@ -227,6 +254,61 @@ def _trimesh_to_dict(mesh: trimesh.Trimesh) -> dict:
     return {"vertices": verts, "faces": faces, "vertex_colors": colors}
 
 
+class _DegenerateCompletion(Exception):
+    """Raised when a completion decodes to no usable geometry (endpoint returns 422)."""
+
+
+def _drop_nonfinite(mesh_dict: dict, n_voxels: int = -1) -> dict:
+    """Drop non-finite vertices and any face touching them.
+
+    The SLAT mesh decoder emits NaN vertices when it runs on a near-empty latent:
+    a low-evidence object can leave only a hundred-odd voxels alive through the
+    sparse-structure stage, and FlexiCubes' zero-crossing interpolation divides by
+    the SDF difference across an edge (`_linear_interp`, no epsilon), which goes to
+    NaN on degenerate cells. Nothing downstream tolerates that — the first thing to
+    notice is the KDTree in `_decimate_mesh_dict`, which raises a bare
+    "Input contains NaN" with no hint of where it came from.
+
+    Repairing here is only right when the NaNs are a minority of an otherwise real
+    mesh. If they aren't, the completion is junk and the caller needs to know that,
+    so an empty survivor set raises rather than returning a plausible-looking husk.
+    """
+    verts = np.asarray(mesh_dict["vertices"], dtype=np.float32)
+    faces = np.asarray(mesh_dict["faces"], dtype=np.int32)
+    colors = np.asarray(mesh_dict["vertex_colors"], dtype=np.float32)
+
+    ctx = f"n_voxels={n_voxels}" if n_voxels >= 0 else "n_voxels=unknown"
+    if len(verts) == 0 or len(faces) == 0:
+        raise _DegenerateCompletion(
+            f"decoder returned an empty mesh ({len(verts)} verts / {len(faces)} faces, {ctx})"
+        )
+
+    finite_v = np.isfinite(verts).all(axis=1)
+    if finite_v.all():
+        return mesh_dict
+
+    faces = faces[finite_v[faces].all(axis=1)]
+    if len(faces) == 0:
+        raise _DegenerateCompletion(
+            f"every face touches a non-finite vertex "
+            f"({int((~finite_v).sum())}/{len(verts)} verts are NaN/inf, {ctx})"
+        )
+
+    # Reindex onto just the vertices a surviving face still references.
+    used = np.zeros(len(verts), dtype=bool)
+    used[faces.reshape(-1)] = True
+    remap = (np.cumsum(used) - 1).astype(np.int32)
+    print(
+        f"  _drop_nonfinite: dropped {int((~finite_v).sum())} non-finite verts "
+        f"({len(verts)}v/{len(mesh_dict['faces'])}f -> {int(used.sum())}v/{len(faces)}f, {ctx})"
+    )
+    return {
+        "vertices": verts[used],
+        "faces": remap[faces].astype(np.int32),
+        "vertex_colors": colors[used],
+    }
+
+
 def run_recgen_single(image, depth_map, mask, K) -> dict:
     """Run RecGen on one object given the full scene RGB-D plus a mask.
 
@@ -264,7 +346,9 @@ def run_recgen_single(image, depth_map, mask, K) -> dict:
         formats=["mesh"],  # skip gaussian / radiance-field decoders — only mesh is used
     )
 
+    n_voxels = len(result._outputs.get("coords", ()))
     mesh_dict = _trimesh_to_dict(result.mesh)
+    mesh_dict = _drop_nonfinite(mesh_dict, n_voxels)
     mesh_dict = _decimate_mesh_dict(mesh_dict)
     elapsed = time.time() - start
     print(
@@ -315,6 +399,9 @@ def run_recgen_coarse(image, depth_map, mask, K, grid_resolution: int = 32, step
     )
 
     mesh_dict = _trimesh_to_dict(result.mesh)
+    # Marching cubes over a binary occupancy grid can't produce the NaN vertices the
+    # SLAT decoder can, but a non-finite pose would still poison every vertex here.
+    mesh_dict = _drop_nonfinite(mesh_dict)
     mesh_dict = _decimate_mesh_dict(mesh_dict)
     elapsed = time.time() - start
     print(
@@ -324,14 +411,49 @@ def run_recgen_coarse(image, depth_map, mask, K, grid_resolution: int = 32, step
     return mesh_dict
 
 
+def _warmup() -> None:
+    """Run one synthetic coarse request so the first real one isn't the slow one.
+
+    Compiling the sparse-structure denoiser takes ~30s cold (~5s once
+    TORCHINDUCTOR_CACHE_DIR is warm), and cuDNN/cuBLAS pick their algorithms on
+    first use. Doing that here keeps it off the latency of a real request. The
+    input just has to be a plausible RGB-D object; only shapes matter, and those
+    are identical for every request.
+    """
+    start = time.time()
+    h = w = 256
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    depth = np.zeros((h, w), dtype=np.float32)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    # A slightly tilted patch, so the unit-cube fit sees a non-degenerate extent.
+    depth[80:176, 80:176] = 1.0 + np.linspace(0, 0.2, 96, dtype=np.float32)[:, None]
+    mask[80:176, 80:176] = 1
+    K = np.array([[200.0, 0.0, 128.0], [0.0, 200.0, 128.0], [0.0, 0.0, 1.0]])
+    try:
+        run_recgen_coarse(rgb, depth, mask, K, grid_resolution=32, steps=4)
+        print(f"[recgen_fastapi] warmup done in {time.time() - start:.1f}s")
+    except Exception as e:
+        # Never block startup on the warmup — the compile still happens lazily.
+        print(f"[recgen_fastapi] warmup failed ({type(e).__name__}: {e}); "
+              f"first request will pay the compile cost")
+
+
 # ── FastAPI app ──────────────────────────────────────────────────────────────
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 API_OUTPUT_DIR = os.path.join(os.environ["HOME"], "orcd", "scratch", "api_outputs_recgen")
 
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    _warmup()
+    yield
+
+
 app = FastAPI(
     title="RecGen API",
     description="Single-view RGB-D mesh reconstruction server",
+    lifespan=_lifespan,
 )
 
 
@@ -415,6 +537,13 @@ async def complete_mesh_endpoint(
 
     except _BadRequest as e:
         return JSONResponse(content={"error": str(e)}, status_code=400)
+    except _DegenerateCompletion as e:
+        # The request was fine; the model just had too little evidence for this
+        # object to decode anything usable. Distinct from a 500 so callers can tell
+        # "this object is hopeless, move on" from "the server is broken".
+        return JSONResponse(
+            content={"error": str(e), "reason": "degenerate_completion"}, status_code=422
+        )
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -453,6 +582,10 @@ async def coarse_mesh_endpoint(
 
     except _BadRequest as e:
         return JSONResponse(content={"error": str(e)}, status_code=400)
+    except _DegenerateCompletion as e:
+        return JSONResponse(
+            content={"error": str(e), "reason": "degenerate_completion"}, status_code=422
+        )
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -463,8 +596,12 @@ if __name__ == "__main__":
     import uvicorn
 
     os.makedirs(API_OUTPUT_DIR, exist_ok=True)
+    # Pass the app object, not "recgen_fastapi:app": the import-string form makes
+    # uvicorn import this module a second time (it is __main__ here, so the import
+    # doesn't hit sys.modules), which builds and uploads a whole second copy of the
+    # pipeline. Only reload/workers need the import string, and both are off.
     uvicorn.run(
-        "recgen_fastapi:app",
+        app,
         host="0.0.0.0",
         port=8040,
         reload=False,

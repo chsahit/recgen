@@ -8,9 +8,8 @@ from PIL import Image
 from recgen_inference._result import RecGenResult, build_result
 from recgen_inference.preprocessing import (
     apply_mask_erosion,
-    crop_to_bounding_box,
+    crop_to_bounding_box_cropped,
     normalize_depth,
-    pointmap_from_depth,
     preprocess_view,
 )
 from recgen_inference.utils import coarse_mesh_from_coords, mesh_from_result, parse_pose
@@ -43,12 +42,12 @@ def _preprocess_single(
     valid = depth_masked > 0
 
     pil_image = Image.fromarray(image)
-    pointmap_scene = pointmap_from_depth(depth_masked, intrinsics)
 
-    pointmap_tensor, resized_image, resized_mask, cam2ncam = crop_to_bounding_box(
-        pointmap_scene,
+    pointmap_tensor, resized_image, resized_mask, cam2ncam = crop_to_bounding_box_cropped(
+        depth_masked,
+        intrinsics,
         pil_image,
-        Image.fromarray(mask_eroded),
+        mask_eroded,
         valid,
         quantile_drop_threshold=quantile_drop_threshold,
         clamp_range=clamp_range,

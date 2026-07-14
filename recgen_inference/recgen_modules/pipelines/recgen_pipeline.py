@@ -73,9 +73,10 @@ class RecGenPipeline(Pipeline):
         elif isinstance(image, list):
             assert all(isinstance(i, Image.Image) for i in image), "Image list should be list of PIL images"
             image = [i.resize((518, 518), Image.LANCZOS) for i in image]
-            image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
-            image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).to(self.device)
+            # Upload as uint8 and scale on the GPU: 4x less PCIe traffic than
+            # uploading float32, and the divide stops being a CPU-side pass.
+            image = np.stack([np.asarray(i.convert('RGB')) for i in image])
+            image = torch.from_numpy(image).to(self.device).permute(0, 3, 1, 2).float().div_(255)
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         

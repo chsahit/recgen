@@ -36,3 +36,6 @@ Thumbs.db
 .nfs*
 hf/
 out/
+
+# torch.compile / inductor kernel cache (only used when TORCHINDUCTOR_CACHE_DIR is unset)
+.torchinductor_cache/
