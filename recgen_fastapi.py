@@ -504,6 +504,30 @@ async def health_check():
             "scene_cache": dict(SCENE_CACHE_STATS)}
 
 
+@app.post("/reset_scene_cache/")
+async def reset_scene_cache():
+    """Drop the decoded-scene cache and zero its counters. A BENCH hook.
+
+    The cache is keyed on a content hash, and a replayed session feeds
+    byte-identical frames every run, so entries SURVIVE ACROSS RUNS while the OBM
+    is rebuilt from scratch: the second arm to run a seed would start with the
+    first arm's frames already decoded, and the advantage would land on whichever
+    arm happened to go second. That is order-dependent and unreproducible — the
+    within-experiment drift bench-pairing-drift warns about, which interleaving
+    cannot cancel. Call this at run START so every run pays its own decodes.
+
+    Within a run the cache is legitimate and stays on: one session really does
+    request the same frame for many objects, which is the ~0.4s/repeat this exists
+    to reclaim.
+    """
+    with _SCENE_CACHE_LOCK:
+        n = len(_SCENE_CACHE)
+        _SCENE_CACHE.clear()
+        for k in SCENE_CACHE_STATS:
+            SCENE_CACHE_STATS[k] = 0
+    return {"cleared": n}
+
+
 class _BadRequest(Exception):
     """Raised for input-shape mismatches so the endpoint returns HTTP 400."""
 
@@ -541,10 +565,16 @@ def _archive(experiment_id: str, files: dict) -> None:
 # builds a fresh array and `depth_map.astype(np.float32)` copies (numpy's astype
 # defaults to copy=True). A future in-place edit of `depth_map` would corrupt every
 # later request for that frame, which would look like a model bug, not a cache bug.
+#
+# Is 4 enough? {hits, decodes} alone cannot say: an evicted-then-re-requested frame
+# looks identical to a genuinely new one. `evictions` is the diagnostic —
+# evictions == 0 means the bound never bound and a bigger cache buys nothing.
+# Measured cold on off_frame_1: 37 requests / 16 distinct frames / 21 hits = the
+# theoretical max (37-16), 0 evictions. Busier scenes (0708_3) are unmeasured.
 _SCENE_CACHE_MAX = 4
 _SCENE_CACHE: "OrderedDict[bytes, tuple]" = OrderedDict()
 _SCENE_CACHE_LOCK = threading.Lock()
-SCENE_CACHE_STATS = {"hits": 0, "decodes": 0}
+SCENE_CACHE_STATS = {"hits": 0, "decodes": 0, "evictions": 0}
 
 
 def _scene_key(rgb_bytes, depth_bytes, intr_bytes, depth_name):
@@ -589,6 +619,7 @@ def _decode_scene(rgb_bytes, depth_bytes, intr_bytes, depth_name):
         _SCENE_CACHE.move_to_end(key)
         while len(_SCENE_CACHE) > _SCENE_CACHE_MAX:
             _SCENE_CACHE.popitem(last=False)
+            SCENE_CACHE_STATS["evictions"] += 1
     return image, depth_map, K
 
 
