@@ -240,6 +240,34 @@ def _decimate_mesh_dict(mesh_dict: dict) -> dict:
     return _enforce_mesh_caps(mesh_dict)
 
 
+def _coarse_decimate(mesh_dict: dict) -> dict:
+    """Single-pass decimation for the coarse mesh.
+
+    The coarse mesh only feeds ICP, which has no JIT shape constraints, so this
+    skips what `_decimate_mesh_dict` needs and the coarse path doesn't:
+    the second `_enforce_mesh_caps` pass, and the KDTree color transfer (the
+    marching-cubes mesh is uniform gray anyway). agg=10 buys speed at the cost
+    of geometric fidelity that ICP doesn't need.
+    """
+    n_faces = len(mesh_dict["faces"])
+    if n_faces > TARGET_FACES:
+        verts_out, faces_out = fast_simplification.simplify(
+            mesh_dict["vertices"].astype(np.float64),
+            mesh_dict["faces"].astype(np.int64),
+            target_count=TARGET_FACES,
+            agg=10,
+        )
+        print(f"  _coarse_decimate: {n_faces} -> {len(faces_out)} faces")
+    else:
+        verts_out, faces_out = mesh_dict["vertices"], mesh_dict["faces"]
+
+    return {
+        "vertices": np.asarray(verts_out, dtype=np.float32),
+        "faces": np.asarray(faces_out, dtype=np.int32),
+        "vertex_colors": np.full((len(verts_out), 3), 0.5, dtype=np.float32),
+    }
+
+
 # ── Mesh extraction ───────────────────────────────────────────────────────────
 
 def _trimesh_to_dict(mesh: trimesh.Trimesh) -> dict:
@@ -408,7 +436,7 @@ def run_recgen_coarse(image, depth_map, mask, K, grid_resolution: int = 32, step
     # Marching cubes over a binary occupancy grid can't produce the NaN vertices the
     # SLAT decoder can, but a non-finite pose would still poison every vertex here.
     mesh_dict = _drop_nonfinite(mesh_dict)
-    mesh_dict = _decimate_mesh_dict(mesh_dict)
+    mesh_dict = _coarse_decimate(mesh_dict)
     elapsed = time.time() - start
     print(
         f"run_recgen_coarse done in {elapsed:.2f}s "
