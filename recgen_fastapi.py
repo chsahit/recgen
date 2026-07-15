@@ -25,9 +25,12 @@ if _env_lib not in os.environ.get("LD_LIBRARY_PATH", "").split(":"):
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 import argparse
+import hashlib
 import io
 import pickle
+import threading
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 
 # Give inductor a cache dir that survives restarts, so the startup warmup below is a
@@ -493,7 +496,12 @@ async def _log_request_time(request: Request, call_next):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "recgen_server"}
+    # scene_cache: hits/decodes of the content-hashed frame decode. hits ~= 0 with
+    # decodes climbing means callers are sending byte-varying frames (a re-encode
+    # upstream) and the cache is dead weight — the client re-encoding a frame
+    # non-deterministically would look exactly like this.
+    return {"status": "healthy", "service": "recgen_server",
+            "scene_cache": dict(SCENE_CACHE_STATS)}
 
 
 class _BadRequest(Exception):
@@ -518,18 +526,69 @@ def _archive(experiment_id: str, files: dict) -> None:
         print(f"[recgen_fastapi] --save-outputs write failed for {experiment_id}: {e}")
 
 
+# Decoding the ~3.4MB scene RGB-D costs ~0.4s and is a pure function of the
+# uploaded bytes, but the single-object endpoints re-pay it on EVERY call and the
+# client prices many objects against the same frame in a row: one measured
+# off_frame_1 run made 46 scene-payload requests (complete + coarse) across only
+# 15 distinct frames, so ~31 decodes (~12s/run) were recomputing a byte-identical
+# result. Cache the decoded scene keyed on a content hash of the uploads.
+#
+# Entries are ~15MB (float32 depth + RGB), so the bound matters; 4 covers the
+# repeat window (a featurize pass reuses a handful of frames) at ~60MB.
+#
+# INVARIANT: cached values are shared across requests and MUST NOT be mutated.
+# Safe today because run_recgen_* copies before touching either — `np.asarray(image)`
+# builds a fresh array and `depth_map.astype(np.float32)` copies (numpy's astype
+# defaults to copy=True). A future in-place edit of `depth_map` would corrupt every
+# later request for that frame, which would look like a model bug, not a cache bug.
+_SCENE_CACHE_MAX = 4
+_SCENE_CACHE: "OrderedDict[bytes, tuple]" = OrderedDict()
+_SCENE_CACHE_LOCK = threading.Lock()
+SCENE_CACHE_STATS = {"hits": 0, "decodes": 0}
+
+
+def _scene_key(rgb_bytes, depth_bytes, intr_bytes, depth_name):
+    """Content hash of the frame-level uploads. ~3ms on 3.4MB — worth it against a
+    ~0.4s decode. `depth_name`'s extension is part of the key because _decode_depth
+    dispatches on it (.npy metres vs .png millimetres), so the same bytes can decode
+    two different ways."""
+    h = hashlib.blake2b(digest_size=16)
+    for blob in (rgb_bytes, depth_bytes, intr_bytes):
+        h.update(len(blob).to_bytes(8, "little"))   # length-prefixed: no concat ambiguity
+        h.update(blob)
+    h.update(os.path.splitext(depth_name)[1].lower().encode())
+    return h.digest()
+
+
 def _decode_scene(rgb_bytes, depth_bytes, intr_bytes, depth_name):
     """Decode the per-frame (object-independent) inputs: (image, depth_map, K).
 
     Split out of :func:`_load_request_inputs` so /coarse_mesh_batch/ pays this
     once per frame instead of once per object — the scene RGB-D is ~3.4MB and its
-    multipart parse + PIL decode was ~0.4s of every ~0.9s single call.
+    multipart parse + PIL decode was ~0.4s of every ~0.9s single call. Cached on a
+    content hash, so repeat calls against the same frame skip it entirely.
     """
+    key = _scene_key(rgb_bytes, depth_bytes, intr_bytes, depth_name)
+    with _SCENE_CACHE_LOCK:
+        hit = _SCENE_CACHE.get(key)
+        if hit is not None:
+            _SCENE_CACHE.move_to_end(key)
+            SCENE_CACHE_STATS["hits"] += 1
+            return hit
+    # decode off-lock: two requests racing the same frame waste one decode, which
+    # is cheaper than serialising every caller behind a ~0.4s hold
     image = Image.open(io.BytesIO(rgb_bytes)).convert("RGB")
     depth_map = _decode_depth(depth_bytes, depth_name)
     K = _decode_intrinsics(intr_bytes)
     if depth_map.shape[:2] != (image.size[1], image.size[0]):
+        # not cached: a malformed frame must not occupy a slot, and it 400s anyway
         raise _BadRequest(f"depth shape {depth_map.shape[:2]} does not match rgb {(image.size[1], image.size[0])}")
+    with _SCENE_CACHE_LOCK:
+        SCENE_CACHE_STATS["decodes"] += 1
+        _SCENE_CACHE[key] = (image, depth_map, K)
+        _SCENE_CACHE.move_to_end(key)
+        while len(_SCENE_CACHE) > _SCENE_CACHE_MAX:
+            _SCENE_CACHE.popitem(last=False)
     return image, depth_map, K
 
 
